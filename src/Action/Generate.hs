@@ -103,14 +103,10 @@ readHaskellOnline timing settings download = do
     -- peakMegabytesAllocated = 2
     setStackage <- Set.map strPack <$> (Set.union <$> setStackage stackageLts <*> setStackage stackageNightly)
     setPlatform <- Set.map strPack <$> setPlatform platform
-    setGHC <- Set.map strPack <$> setGHC platform
 
     cbl <- timed timing "Reading Cabal" $ parseCabalTarball settings cabals
-    let want = Set.insert (strPack "ghc") $ Set.unions [setStackage, setPlatform, setGHC]
     cbl <- pure $ flip Map.mapWithKey cbl $ \name p ->
         p{packageTags =
-            [(strPack "set",strPack "included-with-ghc") | name `Set.member` setGHC] ++
-            [(strPack "set",strPack "haskell-platform") | name `Set.member` setPlatform] ++
             [(strPack "set",strPack "stackage") | name `Set.member` setStackage] ++
             packageTags p}
 
@@ -118,7 +114,7 @@ readHaskellOnline timing settings download = do
             tar <- liftIO $ tarballReadFiles hoogles
             forM_ tar $ \(strPack . takeBaseName -> name, src) ->
                 yield (name, hackagePackageURL name, src)
-    pure (cbl, want, source)
+    pure (cbl, undefined, source)
 
 
 readHaskellDirs :: Timing -> Settings -> [FilePath] -> IO (Map.Map PkgName Package, Set.Set PkgName, ConduitT () (PkgName, URL, LBStr) IO ())
@@ -233,7 +229,7 @@ actionGenerate g@Generate{..} = withTiming (if debug then Just $ replaceExtensio
           downloadInput timing insecure download' (takeDirectory database) name url
 
     settings <- loadSettings
-    (cbl, want, source) <- case language of
+    (cbl, _want, source) <- case language of
         Haskell | Just dir <- haddock -> do
                     warnFlagIgnored "--haddock" "set" (local_ /= []) "--local"
                     warnFlagIgnored "--haddock" "set" (isJust download) "--download"
@@ -249,12 +245,6 @@ actionGenerate g@Generate{..} = withTiming (if debug then Just $ replaceExtensio
     cbl <- evaluate $ Map.map (\p -> p{packageDepends=[]}) cbl -- clear the memory, since the information is no longer used
     evaluate popularity
 
-    -- mtl is more popular than transformers, despite having dodgy docs, which is a shame, so we hack it
-    popularity <- evaluate $ Map.adjust (max $ 1 + Map.findWithDefault 0 (strPack "mtl") popularity) (strPack "transformers") popularity
-
-    want <- pure $ if include /= [] then Set.fromList $ map strPack include else want
-    want <- pure $ case count of Nothing -> want; Just count -> Set.fromList $ take count $ Set.toList want
-
     (stats, _) <- storeWriteFile database $ \store -> do
         xs <- withBinaryFile (database `replaceExtension` "warn") WriteMode $ \warnings -> do
             hSetEncoding warnings utf8
@@ -266,34 +256,24 @@ actionGenerate g@Generate{..} = withTiming (if debug then Just $ replaceExtensio
 
             let consume :: ConduitM (Int, (PkgName, URL, LBStr)) (Maybe Target, [Item]) IO ()
                 consume = awaitForever $ \(i, (strUnpack -> pkg, url, body)) -> do
-                    timedOverwrite timing ("[" ++ show i ++ "/" ++ show (Set.size want) ++ "] " ++ pkg) $
+                    timedOverwrite timing ("[" ++ show i ++ "/ " ++ show (Map.size cbl)  ++ " ] " ++ pkg) $
                         parseHoogle (\msg -> warning $ pkg ++ ":" ++ msg) url body
 
             writeItems store $ \items -> do
                 xs <- runConduit $
                     source .|
-                    filterC (flip Set.member want . fst3) .|
                     void ((|$|)
                         (zipFromC 1 .| consume)
                         (do seen <- fmap Set.fromList $ mapMC (evaluate . force . strCopy . fst3) .| sinkList
-                            let missing = [x | x <- Set.toList $ want `Set.difference` seen
-                                             , fmap packageLibrary (Map.lookup x cbl) /= Just False]
                             liftIO $ putStrLn ""
-                            liftIO $ whenNormal $ when (missing /= []) $ do
-                                putStrLn $ "Packages missing documentation: " ++ unwords (sortOn lower $ map strUnpack missing)
                             liftIO $ when (Set.null seen) $
                                 exitFail "No packages were found, aborting (use no arguments to index all of Stackage)"
                             -- synthesise things for Cabal packages that are not documented
                             forM_ (Map.toList cbl) $ \(name, Package{..}) -> when (name `Set.notMember` seen) $ do
                                 let ret prefix = yield $ fakePackage name $ prefix ++ trim (strUnpack packageSynopsis)
-                                if name `Set.member` want then
-                                    (if packageLibrary
-                                        then ret "Documentation not found, so not searched.\n"
-                                        else ret "Executable only. ")
-                                else if null include then
-                                    ret "Not on Stackage, so not searched.\n"
-                                else
-                                    pure ()
+                                (if packageLibrary
+                                      then ret "Documentation not found, so not searched.\n"
+                                      else ret "Executable only. ")
                             ))
                     .| pipelineC 10 (items .| sinkList)
 
@@ -304,7 +284,7 @@ actionGenerate g@Generate{..} = withTiming (if debug then Just $ replaceExtensio
 
         itemsMemory <- getStatsCurrentLiveBytes
         xs <- timed timing "Reordering items" $ pure $! reorderItems settings (\s -> maybe 1 negate $ Map.lookup s popularity) xs
-        timed timing "Writing tags" $ writeTags store (`Set.member` want) (\x -> maybe [] (map (both strUnpack) . packageTags) $ Map.lookup x cbl) xs
+        timed timing "Writing tags" $ writeTags store (const True) (\x -> maybe [] (map (both strUnpack) . packageTags) $ Map.lookup x cbl) xs
         timed timing "Writing names" $ writeNames store xs
         timed timing "Writing types" $ writeTypes store (if debug then Just $ dropExtension database else Nothing) xs
 
